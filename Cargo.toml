@@ -1,0 +1,11 @@
+[package]
+name = "async_generator"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+futures-util = { version = "0.3", default_features=false }
+pin-project = "1.0"
+
+[dev-dependencies]
+tokio = {version="1.18", features=["rt", "macros", "time"]}
