@@ -1,4 +1,5 @@
 #![feature(pin_macro)]
+#![feature(generators, generator_trait)]
 
 /// A future which returns [::core::task::Poll::Pending] once
 ///
@@ -85,10 +86,73 @@ impl<'a, S, F: core::future::Future<Output = ()>> futures_util::stream::Stream
 }
 
 /// convenience macro for creating and pinning a generator
+#[macro_export]
 macro_rules! async_generator {
     ($state:ident, $future:expr) => {
         ::core::pin::pin!($crate::Generator::new(&($state), $future))
     };
+}
+
+#[pin_project::pin_project]
+pub struct AsyncGenerator<G> {
+    #[pin]
+    generator: G,
+}
+
+impl<G: core::ops::Generator<core::task::Waker, Yield = core::task::Poll<Y>, Return = ()>, Y>
+    AsyncGenerator<G>
+{
+    pub fn new(generator: G) -> Self {
+        Self { generator }
+    }
+}
+
+impl<G: core::ops::Generator<core::task::Waker, Yield = core::task::Poll<Y>, Return = ()>, Y>
+    futures_util::stream::Stream for AsyncGenerator<G>
+{
+    type Item = Y;
+
+    fn poll_next(
+        self: core::pin::Pin<&mut Self>,
+        cx: &mut core::task::Context<'_>,
+    ) -> core::task::Poll<Option<Self::Item>> {
+        match self.project().generator.resume(cx.waker().clone()) {
+            core::ops::GeneratorState::Yielded(val) => val.map(Some),
+            core::ops::GeneratorState::Complete(()) => core::task::Poll::Ready(None),
+        }
+    }
+}
+
+#[macro_export]
+macro_rules! genyield {
+    ($waker:ident, $value:expr) => {{
+        let _ = &$waker;
+        $waker = yield ::core::task::Poll::Ready($value);
+        let _ = &$waker;
+    }};
+}
+
+#[macro_export]
+macro_rules! genawait {
+    ($waker:ident, $future:expr) => {{
+        use ::core::future::Future as _;
+
+        let mut fut = $future;
+        loop {
+            // SAFETY: The generator is part of the stream future which is !Unpin.
+            //         Thus, we can only get here if the future was pinned.
+            let fut = unsafe { core::pin::Pin::new_unchecked(&mut fut) };
+
+            match fut.poll(&mut ::core::task::Context::from_waker(&$waker)) {
+                core::task::Poll::Ready(val) => break val,
+                core::task::Poll::Pending => {
+                    let _ = &$waker;
+                    $waker = yield core::task::Poll::Pending;
+                    let _ = &$waker;
+                }
+            }
+        }
+    }};
 }
 
 #[cfg(test)]
@@ -106,11 +170,43 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn it_works() {
+    async fn variant_1() {
         let genstate = super::GeneratorState::default();
         let mut gen = async_generator!(genstate, |genstate| doit(genstate));
 
         while let Some(val) = gen.next().await {
+            eprintln!("VAL: {:#?}", val);
+        }
+    }
+
+    fn makegen() -> impl futures_util::stream::Stream<Item = usize> {
+        super::AsyncGenerator::new(|mut waker| {
+            genyield!(waker, 42usize);
+            genawait!(
+                waker,
+                tokio::time::sleep(tokio::time::Duration::from_millis(2000))
+            );
+            genyield!(waker, 43usize);
+        })
+    }
+
+    #[tokio::test]
+    async fn variant_2a() {
+        let mut generator = makegen();
+        while let Some(val) = generator.next().await {
+            eprintln!("VAL: {:#?}", val);
+        }
+    }
+
+    #[tokio::test]
+    async fn variant_2b() {
+        let mut generator = super::AsyncGenerator::new(|mut waker| {
+            genyield!(waker, 42usize);
+            eprintln!("yoooo1");
+            genyield!(waker, 43usize);
+            eprintln!("yoooo2");
+        });
+        while let Some(val) = generator.next().await {
             eprintln!("VAL: {:#?}", val);
         }
     }
